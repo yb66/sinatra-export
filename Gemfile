@@ -4,6 +4,7 @@ group :development do
   gem "term-ansicolor"
   gem "pry-byebug"
   gem "pry-stack_explorer"
+  gem "pry-state"
 end
 
 group :development, :test do
@@ -15,6 +16,7 @@ group :test do
   gem 'rake'
   gem 'rspec'
   gem 'rspec-its'
+  gem "rspec-given"
   gem 'simplecov'
 end
 
