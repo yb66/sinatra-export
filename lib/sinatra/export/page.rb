@@ -118,11 +118,13 @@ module Sinatra
             milestone_processing_block
             Fiber.yield
             result = Marshal.load(rd.read)
-            if result.first.respond_to? :uniq
-              @new_paths, body = *result
-              @resp.body = [body] if body
-            else
-              @new_paths = result
+            unless result.nil? || result.empty?
+              if result.first.respond_to? :uniq
+                @new_paths, body = *result
+                @resp.body = [body] if body
+              else
+                @new_paths = result
+              end
             end
           end
 
