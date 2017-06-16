@@ -2,7 +2,12 @@
 
 require 'rspec'
 require 'rspec/its'
-require 'pry-byebug' if ENV["WITH_PRY"]
+require 'rspec/given'
+if ENV["DEBUG"]
+  require 'pry-byebug'
+  require 'pry-state'
+  binding.pry
+end
 Spec_dir = File.expand_path( File.dirname __FILE__ )
 
 

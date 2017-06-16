@@ -1,8 +1,9 @@
 require 'sinatra/base'
 require 'sinatra/advanced_routes'
 require 'rack/test'
-require 'term/ansicolor'
 require 'pathname'
+require 'thread' # for Queue
+require_relative 'export/page.rb'
 
 module Sinatra
 
@@ -65,67 +66,78 @@ module Sinatra
           if self.builder
             self.builder
           else
-            Builder.new(self, paths: paths, skips: skips, filters: filters, use_routes: use_routes, error_handler: error_handler )
+            Builder.new(self, paths: paths, skips: skips, filters: filters, use_routes: use_routes, error_handler: error_handler, &block )
           end
-        @builder.build! &block
+        @builder.build!
       end
     end
 
-
-    # Visits the paths and builds pages from the output
     class Builder
-      include Rack::Test::Methods
 
-      # Default error handler
-      # @yieldparam [String] desc Description of the error.
-      DEFAULT_ERROR_HANDLER = ->(desc) {
-        puts ColorString.new("failed: #{desc}").red;
-      }
-
-      class ColorString < String
-        include Term::ANSIColor
-      end
-
-
+      # TODO check this
       # @param [Sinatra::Base] app The Sinatra app
       # @param (see ClassMethods#export!)
       # @yield [builder] Gives a Builder instance to the block (see Builder) that is called for every path visited.
-      def initialize(app, paths: nil, skips: nil, use_routes: nil, filters: [], error_handler: nil )
+      def initialize app, paths: [], skips: [], use_routes: nil, filters: [], error_handler: nil, &block
         @app = app
+        Page.app = app
+        @block  = block
+        @paths  = Queue.new
+        if paths.nil? or paths.empty?
+          @paths << ["/", 200]
+        else
+          paths.each do |path,status=200|
+            @paths << [path,status]
+          end
+        end
+
         @use_routes = paths.nil? && use_routes.nil? ? true : use_routes
-        @paths  = paths || []
-        @skips  = skips || []
-        @enums  = []
-        @filters  = filters
-        @visited  = []
-        @errored  = []
-        @error_handler = error_handler || DEFAULT_ERROR_HANDLER
+        if @use_routes
+          app.each_route do |route|
+            next if route.verb != 'GET'
+            next unless route_path_usable?(route.path)
+            @paths << [route.path,200]
+          end
+        end
+        # A hash is much faster lookup than an array.
+        @skips  = Hash[
+                    skips.map{|path|
+                      path.end_with?("?") ?
+                        path.chop :
+                        path
+                    }.zip [nil]
+                  ]
+        @pids   = {}
+        @initial_workers = 4
+        @workers = @initial_workers
+        if filters.respond_to? :each
+          filters.each {|filter| Page.filters << filter }
+        else
+          Page.filters << filters
+        end
+        @pages = {}
+#         @errored  = []
+        Page.error_handler = error_handler if error_handler
+        @dir = Pathname( ENV["EXPORT_BUILD_DIR"] || app.public_folder )
+        if @dir.exist?
+          if !@dir.directory?
+            fail "The output directory #{@dir} is not a directory"
+          end
+        else
+          @dir.mkpath
+        end
+        Page.output_dir = @dir
       end
 
-      # @!attribute [r] last_response
-      #   @return [Rack::MockResponse] The last page requested's response
-      attr_reader :last_response
-
-      # @!attribute [r] last_path
-      #   @return [String] The last path requested
-      attr_reader :last_path
-
-      # @!attribute [r] visited
-      #   @return [Array<String>] List of paths visited by the builder
-      attr_reader :visited
+      attr_reader :paths, :pages
 
       # @!attribute [r] errored
       #   @return [Array<String>] List of paths visited by the builder that called the error handler
       attr_reader :errored
 
-      # @!attribute [w] error_handler
-      # Error handler (see ClassMethods#export!)
-      #   @return [nil]
-      attr_writer :error_handler
-
       # @!attribute paths
       # Paths to visit (see ClassMethods#export!)
-      #   @return [Array<String,URI>]
+      #   @return [Queue<String,URI>]
       attr_accessor :paths
 
       # @!attribute skips
@@ -134,171 +146,93 @@ module Sinatra
       attr_accessor :skips
 
 
-      def app
-        @app
+      def visited
+        @pages.select{|_,page| page.finished? }
+              .map{|path,_| path }
       end
 
 
-      # Processes the routes and builds the output files.
-      # @yield [builder] Gives a Builder instance to the block (see Builder) that is called for every path visited.
-      # @return [self]
-      def build!(&block)
-        dir = Pathname( ENV["EXPORT_BUILD_DIR"] || app.public_folder )
-        handle_error_dir_not_found!(dir) unless dir.exist? && dir.directory?
+      def errored
+        @pages.select{|_,page| page.errored? }
+              .map{|path,_| path }
+      end
 
-        if @use_routes
-          @enums.push self.send(:route_paths).to_enum
-        end
-        @enums.push @paths.to_enum
+      def app
+        @app
+      end
+  
 
-        catch(:no_more_paths) do
-          enum = @enums.shift
-          while true
-            begin
-              @last_path, status = enum.next
-              @last_path = @last_path.respond_to?(:path) ?
-                            @last_path.path :
-                            @last_path.to_s
-              next unless route_path_usable?(@last_path)
-              next if @skips.include? @last_path
-              @last_path = @last_path.chop if @last_path.end_with? "?"
-              desc = catch(:status_error) {
-                @last_response = get_path(@last_path, status)
-                block.call self if block
-                file_path = build_path(path: @last_path, dir: dir, response: last_response)
-                nil
-              }
-              desc ?
-                @errored |= [@last_path] :
-                @visited |= [@last_path]
-            rescue StopIteration
-              retry if enum = @enums.shift
-              throw(:no_more_paths)
+      def build!
+        loop do
+          if @block
+            # reap and resume any workers
+            if @workers < @initial_workers
+              begin
+              wpid, exit_status = Process.waitpid2(-1, Process::WNOHANG)
+              rescue Errno::ECHILD
+                # do nothing
+              end
+              if wpid
+                begin
+                record = @pages.find{|path,page| page.pid == wpid }
+                _,page = record
+                page.resume if page # This might indicate a problem
+                if new_paths = page.new_paths
+                  new_paths.uniq.each do |path|
+                    spawn_page path
+                  end
+                end
+                rescue IO::EAGAINWaitReadable
+                  # do nothing, it's not a problem
+                end
+              end
+            end
+            @workers.times do
+              if record = @pages.find{|path,page| page.milestone == :responded_to }
+                _,page = record
+                @workers -= 1
+                page.resume
+              else
+                break # this little loop
+              end
             end
           end
+
+          @pages.select{|path,page|
+            !(page.milestone == :processing_block ||
+              page.finished? )
+          }.each do |_,page|
+            page.resume
+          end
+
+          until @paths.empty?
+            spawn_page *@paths.pop
+          end
+          break if @pages.all?{|path,page| page.milestone == :finish } && @paths.empty?
         end
         self
       end
 
-      private
+      # A convenience method to keep this logic together
+      # and reusable
+      # @param [String,Regexp] path
+      # @return [TrueClass] Whether the path is a straightforward path (i.e. usable) or it's a regex or path with named captures / wildcards (i.e. unusable).
+      def route_path_usable? path
+        res = path.respond_to?( :~ )  ||  # skip regex
+              path =~ /(?:\:\w+)|\*/  ||  # keys and splats
+              path =~ /[\%\\]/        ||  # special chars
+              path[0..-2].include?("?") # an ending ? is acceptable, it'll be chomped
+        !res
+      end
 
-        # a convenience wrapper for throwing status errors
-        def status_error desc
-          throw :status_error, desc
+
+      def spawn_page path, status=200
+        path = path.chop if path.end_with? "?"
+        unless @skips.has_key? path
+          @pages[path] ||= Page.new path, status: status, &@block
         end
+      end
 
-        # A convenience method to keep this logic together
-        # and reusable
-        # @param [String,Regexp] path
-        # @return [TrueClass] Whether the path is a straightforward path (i.e. usable) or it's a regex or path with named captures / wildcards (i.e. unusable).
-        def route_path_usable? path
-          res = path.respond_to?( :~ )  ||  # skip regex
-                path =~ /(?:\:\w+)|\*/  ||  # keys and splats
-                path =~ /[\%\\]/        ||  # special chars
-                path[0..-2].include?("?") # an ending ? is acceptable, it'll be chomped
-          !res
-        end
-
-
-        # Wrapper around Sinatra::AdvancedRoutes#each_route
-        # to filter what comes through.
-        # @return [Array<String>]
-        def route_paths
-          route_paths = []
-          app.each_route do |route|
-            next if route.verb != 'GET'
-            next unless route_path_usable?(route.path)
-            route_paths << route.path
-          end
-          route_paths
-        end
-
-
-        # Builds the output dirs and file
-        # based on the response.
-        # @param [String] path
-        # @param [Pathname,String] dir
-        # @param [Rack::MockResponse] response
-        # @return [String] file_path
-        def build_path(path: nil, dir: nil, response: nil)
-          # These argument checks are for Ruby v2.0 as it
-          # doesn't support required keyword args.
-          fail ArgumentError, "'path' is a required argument to build_path" if path.nil?
-          fail ArgumentError, "'dir' is a required argument to build_path" if dir.nil?
-          fail ArgumentError, "'response' is a required argument to build_path" if response.nil?
-
-          body = response.body
-          mtime = response.headers.key?("Last-Modified") ?
-            Time.httpdate(response.headers["Last-Modified"]) : Time.now
-
-          pattern = %r{
-            [^/\.]+
-            \.
-            (
-              #{app.settings.export_extensions.join("|")}
-            )
-          $}x
-          file_path = Pathname( File.join dir, path )
-          file_path = file_path.join( 'index.html' ) unless  path.match(pattern)
-          ::FileUtils.mkdir_p( file_path.dirname )
-          write_path content: body, path: file_path
-          ::FileUtils.touch(file_path, :mtime => mtime)
-          file_path
-        end
-
-
-        # Write the response to file.
-        # Uses whatever filters were set, on the content.
-        # @param [String] content
-        # @param [Pathname,String] path
-        def write_path( content: nil, path: nil )
-          # These argument checks are for Ruby v2.0 as it
-          # doesn't support required keyword args.
-          fail ArgumentError, "'content' is a required argument to write_path" if content.nil?
-          fail ArgumentError, "'path' is a required argument to write_path" if path.nil?
-
-          if @filters && !@filters.empty?
-            content = @filters.inject(content) do |current_content,filter|
-              filter.call current_content
-            end
-          end
-          ::File.open(path, 'w+') do |f|
-            f.write(content)
-          end
-        end
-
-
-        # Wrapper around Rack::Test's `get`
-        # @param [String] path
-        # @param [Integer] status The expected response status code. Anything different and the error handler is called. Defaults to 200.
-        # @return [Rack::MockResponse]
-        def get_path(path, status=nil)
-          status ||= 200
-          get(path).tap do |resp|
-            handle_error_incorrect_status!(path,expected: status, actual: resp.status) unless resp.status == status
-          end
-        end
-
-
-        def handle_error_dir_not_found!(dir)
-          @error_handler.call("can't find output directory: #{dir.to_s}")
-        end
-
-
-        # Handles the error caused by a mismatch in status code expectations.
-        # @param [String] path The route path.
-        # @param [#to_s] expected The status code that was expected.
-        # @param [#to_s] actual The actual status code received.
-        def handle_error_incorrect_status!(path, expected: nil,actual: nil)
-          # These argument checks are for Ruby v2.0 as it
-          # doesn't support required keyword args.
-          fail ArgumentError, "'expected' is a required argument to handle_error_incorrect_status!" if expected.nil?
-          fail ArgumentError, "'actual' is a required argument to handle_error_incorrect_status!" if actual.nil?
-
-          desc = "GET #{path} returned #{actual} status code instead of #{expected}"
-          @error_handler.call(desc)
-          status_error desc
-        end
     end
   end
 
