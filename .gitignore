@@ -8,3 +8,5 @@ coverage/
 Gemfile.lock
 doc/
 .yardoc/
+.ruby-version
+scratch/
