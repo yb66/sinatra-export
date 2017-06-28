@@ -109,9 +109,14 @@ module Sinatra
             rd, wr = IO.pipe
             @pid = fork do
               $0 = "Forked child from Page #{@path}"
-              rd.close
-              result = @block.call(@resp.body)
+              #rd.close
+              result = @block.call(@resp)
+              begin
               wr.write Marshal.dump(result)
+              rescue Errno::EPIPE => e
+                #binding.pry
+                e
+              end
               #exit!(0) # skips exit handlers.
             end 
             wr.close
@@ -156,7 +161,8 @@ module Sinatra
         @milestone = :block_done
       end
 
-      attr_reader :resp, :new_paths, :pid, :milestone, :status, :block
+      attr_reader :resp, :new_paths, :milestone, :status, :block
+      attr_accessor :pid, :exit_status
 
       def finish
         @milestone = :finish

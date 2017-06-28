@@ -166,7 +166,7 @@ module Sinatra
         loop do
           if @block
             # reap and resume any workers
-            if @workers < @initial_workers
+            if @pages.any?{|path,page| page.pid }
               begin
               wpid, exit_status = Process.waitpid2(-1, Process::WNOHANG)
               rescue Errno::ECHILD
@@ -176,6 +176,8 @@ module Sinatra
                 begin
                 record = @pages.find{|path,page| page.pid == wpid }
                 _,page = record
+                page.pid = nil
+                page.exit_status = exit_status
                 page.resume if page # This might indicate a problem
                 if new_paths = page.new_paths
                   new_paths.uniq.each do |path|

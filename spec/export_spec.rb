@@ -162,9 +162,9 @@ describe "Sinatra Export" do
         Given(:echo1) { public_folder.join('echo-1/index.html') }
 
         When(:builder) {
-          app.export! do |body|
+          app.export! do |resp|
             paths = []
-            if body.include? "/echo-1"
+            if resp.body.include? "/echo-1"
               paths << "/echo-1"
             end
             paths
@@ -185,8 +185,8 @@ describe "Sinatra Export" do
         include_context "Cleanup"
 
         When(:builder) {
-          app.export! do |body|
-            [[],body.upcase]
+          app.export! do |resp|
+            [[],resp.body.upcase]
           end
         }
 
